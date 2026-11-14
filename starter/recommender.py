@@ -13,7 +13,9 @@ import os
 import time
 from pathlib import Path
 from typing import Any
-
+from collections import defaultdict
+from functools import lru_cache
+from gensim.models import Word2Vec
 import requests
 
 for line in Path(".env").read_text().splitlines() if Path(".env").exists() else []:
@@ -24,6 +26,12 @@ TEAM = os.environ["TEAM_ID"]
 http = requests.Session()
 http.headers["Authorization"] = f"Bearer {os.environ['RAWTREE_API_KEY']}"
 
+ROOT = Path(__file__).resolve().parent.parent
+MODEL_PATH = ROOT / "data" / "item2vec.model"
+
+model = Word2Vec.load(str(MODEL_PATH))
+
+print(f"Item2Vec cargado: {len(model.wv)} productos")
 SALES = """
 SELECT product_id, count() AS n
 FROM shop.history_events
@@ -82,17 +90,142 @@ def pull(seen: set[str]) -> list[Record]:
     return fresh
 
 
-def predict(requests: list[Record], best: list[str], unavailable: set[str]) -> list[Record]:
+def predict_baseline(requests: list[Record], best: list[str], unavailable: set[str]) -> list[Record]:
     """One submission per request."""
     return [{"request_id": req["request_id"],
              "items": recommend(req["recent_views"], best, unavailable),
              "model_version": "baseline"} for req in requests]
 
+def predict(
+    requests: list[Record],
+    best: list[str],
+    unavailable: set[str]
+) -> list[Record]:
 
-def recommend(recent_views: list[Record], best: list[str], unavailable: set[str] = frozenset()) -> list[str]:
+    answers = []
+
+    for req in requests:
+        items = recommend(
+            req["recent_views"],
+            best,
+            unavailable,
+            alpha=0.2
+        )
+
+        if len(items) != 10 or len(set(items)) != 10:
+            raise ValueError(
+                f"Invalid recommendation for {req['request_id']}"
+            )
+
+        answers.append({
+            "request_id": req["request_id"],
+            "items": items,
+            "model_version": "item2vec-hybrid-0.2"
+        })
+
+    return answers
+
+def recommend_baseline(recent_views: list[Record], best: list[str], unavailable: set[str] = frozenset()) -> list[str]:
     """10 product IDs for one request: the part teams replace. Here: the first 10 best sellers in stock."""
     return [product for product in best if product not in unavailable][:10]
 
+
+@lru_cache(maxsize=6000)
+def neighbors(pid: str):
+    if pid not in model.wv:
+        return ()
+
+    return tuple(model.wv.most_similar(pid, topn=80))
+
+
+def recommend(
+    recent_views: list[Record],
+    best: list[str],
+    unavailable: set[str] = frozenset(),
+    alpha: float = 0.2
+) -> list[str]:
+
+    views = [
+        v["product_id"]
+        for v in (recent_views or [])
+        if isinstance(v, dict) and v.get("product_id")
+    ]
+
+    # Fallback para usuarios nuevos
+    if not views:
+        return [
+            p for p in best if p not in unavailable
+        ][:10]
+
+    scores = defaultdict(float)
+
+    # Últimos 3 productos visitados
+    for age, pid in enumerate(reversed(views[-3:])):
+        weight = 0.7 ** age
+
+        if pid in model.wv:
+            scores[pid] += weight
+
+        for neighbor, similarity in neighbors(pid):
+            scores[neighbor] += weight * max(0, similarity)
+
+    if not scores:
+        return [
+            p for p in best if p not in unavailable
+        ][:10]
+
+    # Ranking de popularidad
+    pop_rank = {
+        pid: i for i, pid in enumerate(best)
+    }
+
+    # Ranking por embeddings
+    emb_rank = {
+        pid: i
+        for i, (pid, score) in enumerate(
+            sorted(scores.items(), key=lambda x: -x[1])
+        )
+    }
+
+    # Candidatos
+    candidates = (
+        set(best[:200]) | set(scores.keys())
+    ) - unavailable
+
+    # Reciprocal Rank Fusion
+    def rank_score(pid):
+        pop = (
+            1 / (30 + pop_rank[pid])
+            if pid in pop_rank else 0
+        )
+
+        emb = (
+            1 / (30 + emb_rank[pid])
+            if pid in emb_rank else 0
+        )
+
+        return (1 - alpha) * pop + alpha * emb
+
+    ranked = sorted(
+        candidates,
+        key=lambda p: (-rank_score(p), p)
+    )
+
+    # Completar hasta 10 productos sin duplicados
+    result = []
+    selected = set()
+
+    for pid in ranked + best:
+        if pid in selected or pid in unavailable:
+            continue
+
+        result.append(pid)
+        selected.add(pid)
+
+        if len(result) == 10:
+            break
+
+    return result
 
 def push(answers: list[Record]) -> None:
     """Batch insert into team_NN.submissions."""
